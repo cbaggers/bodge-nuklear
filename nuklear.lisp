@@ -7,6 +7,18 @@
 
 ;;----------------------------------------------------------------------
 
+(cffi:defcfun (%memset "memset") :pointer
+  (destination-pointer :pointer)
+  (val :int)
+  (byte-length :long))
+
+(cffi:defcfun (%memcpy "memcpy") :pointer
+  (destination-pointer :pointer)
+  (source-pointer :pointer)
+  (byte-length :long))
+
+;;----------------------------------------------------------------------
+
 (cffi:defcstruct nk-bodge-vertex
   (position (:array :float 2))
   (texture (:array :float 2))
@@ -32,7 +44,11 @@
    (uniform-proj :initarg :uniform-prpoj)
    (font-tex :initarg :font-tex)
    (max-vertex-buffer :initarg :max-vertex-buffer)
-   (max-element-buffer :initarg :max-element-buffer)))
+   (max-element-buffer :initarg :max-element-buffer)
+   ;;
+   (vertex-layout-ptr
+    :initarg :vertex-layout-ptr
+    :initform (claw:calloc '(:struct (%nk:draw-vertex-layout-element)) 4))))
 
 (defun bodge-renderer-upload-atlas (renderer image-ptr width height)
   (with-slots (font-tex) renderer
@@ -46,12 +62,11 @@
 
 (defun bodge-font-stash-begin (renderer)
   (with-slots (atlas) renderer
-    (setf atlas )
     (%nk:font-atlas-init-default atlas)
     (%nk:font-atlas-begin atlas)
     renderer))
 
-(defun bodge-font-stash-end (renderer nk-context)
+(defun bodge-font-stash-end (renderer)
   (with-slots (atlas null-tex font-tex) renderer
     (claw:c-with ((w :int)
                   (h :int))
@@ -67,7 +82,8 @@
     (with-slots (cmds null-tex atlas vbo vao ebo prog vert-shdr frag-shdr
                       attrib-pos attrib-uv attrib-col
                       uniform-tex uniform-proj
-                      max-vertex-buffer max-element-buffer)
+                      max-vertex-buffer max-element-buffer
+                      vertex-layout-ptr)
         rndr
       (let* ((nk-shader-version
               #+darwin "#version 150\n"
@@ -136,9 +152,11 @@
           (gl:bind-vertex-array vao)
           (gl:bind-buffer :array-buffer vbo)
           (gl:bind-buffer :element-array-buffer ebo)
+
           (gl:enable-vertex-attrib-array attrib-pos)
           (gl:enable-vertex-attrib-array attrib-uv)
           (gl:enable-vertex-attrib-array attrib-col)
+
           (gl:vertex-attrib-pointer attrib-pos 2 :float nil vs vp)
           (gl:vertex-attrib-pointer attrib-uv 2 :float nil vs vt)
           (gl:vertex-attrib-pointer attrib-col 4 :uint8 t vs vc))
@@ -149,11 +167,35 @@
         (gl:bind-vertex-array 0)
 
         (bodge-font-stash-begin rndr)
-        (bodge-font-stash-end rndr)
-        rndr))))
+        (bodge-font-stash-end rndr))
+
+      (c-let ((lptr (:struct (%nk:draw-vertex-layout-element))
+                    :from vertex-layout-ptr))
+        (setf (lptr 0 :attribute) %nk:+vertex-position+)
+        (setf (lptr 0 :format) %nk:+format-float+)
+        (setf (lptr 0 :offset) (cffi:foreign-slot-offset
+                                '(:struct nk-bodge-vertex)
+                                'position))
+        (setf (lptr 1 :attribute) %nk:+vertex-texcoord+)
+        (setf (lptr 1 :format) %nk:+format-float+)
+        (setf (lptr 1 :offset) (cffi:foreign-slot-offset
+                                '(:struct nk-bodge-vertex)
+                                'uv))
+
+        (setf (lptr 2 :attribute) %nk:+vertex-color+)
+        (setf (lptr 2 :format) %nk:+format-r8g8b8a8+)
+        (setf (lptr 2 :offset) (cffi:foreign-slot-offset
+                                '(:struct nk-bodge-vertex)
+                                'col))
+        (setf (lptr 3 :attribute) %nk:+vertex-layout-end+)))
+    rndr))
 
 (defun bodge-renderer-font (renderer)
-  (claw:c-let () ))
+  (with-slots (atlas) renderer
+    (claw:c-let ((nk-atlas (:struct (%nk:font-atlas)) :from atlas)
+                 (font (:struct (%nk:font)) :from (nk-atlas :default-font)))
+      ;;(font :handle :&) dont think so as cbv will return it as a ptr
+      (font :handle))))
 
 ;; (claw:c-let ((nk-atlas (:struct (%nk:font-atlas)) :from atlas)
 ;;                    (font (:struct (%nk:font)) :from (nk-atlas :default-font)))
@@ -234,9 +276,126 @@
 
 
 (defun destroy-renderer (renderer)
-  (%nk:bodge-renderer-destroy (nk-renderer-handle renderer)))
+  (with-slots (vert-shdr frag-shdr prog font-tex vbo ebo cmds atlas) renderer
+    (gl:detach-shader prog vert-shdr)
+    (gl:detach-shader prog frag-shdr)
+    (gl:delete-shader vert-shdr)
+    (gl:delete-shader frag-shdr)
+    (gl:delete-program prog)
+    (gl:delete-texture font-tex)
+    (gl:delete-buffers (list vbo ebo))
+    (%nk:buffer-free cmds)
+    (%nk:buffer-free atlas))
+  nil)
 
+(declaim
+ (type (simple-array single-float (16)) *ortho*))
+(defvar *ortho*
+  (make-array 16 :element-type :float
+              :initial-contents
+              '(2.0f0 0.0f0 0.0f0 0.0f0 
+                0.0f0 -2.0f0 0.0f0 0.0f0 
+                0.0f0 0.0f0 -1.0f0 0.0f0 
+                -1.0f0 1.0f0 0.0f0 1.0f0)))
 
 (defun render-nuklear (renderer context width height &optional (pixel-ratio 1f0))
-  (%nk:bodge-render context renderer
-                    (floor width) (floor height) (float pixel-ratio 0f0)))
+  (with-slots (prog uniform-tex uniform-proj vao vbo ebo
+                    max-vertex-buffer max-element-buffer
+                    null-tex cmds vertex-layout-ptr)
+      renderer
+    (let* ((width (floor width))
+           (height (floor height))
+           (pixel-ratio (float pixel-ratio 0f0))
+
+           (aa %nk:+anti-aliasing-on+)
+           (ortho *ortho*))
+      (setf (aref *ortho* 0) (float width 0f0)
+            (aref *ortho* 5) (float height 0f0))
+
+      ;; setup global state
+      (gl:enable :blend)
+      (gl:blend-equation :func-add)
+      (gl:blend-func :src-alpha :one-minus-src-alpha)
+      (gl:disable :cull-face)
+      (gl:disable :depth-test)
+      (gl:enable :scissor-test)
+      (gl:active-texture :texture0)
+
+      ;; setup program
+      (gl:use-program prog)
+      (%gl:uniform-1i uniform-tex 0)
+      (cffi:with-pointer-to-vector-data (ortho-ptr ortho)
+        (%gl:uniform-matrix-4fv uniform-proj 1 nil ortho-ptr))
+      (gl:viewport 0 0 (floor (* width pixel-ratio))
+                   (floor (* height pixel-ratio)))
+
+      ;; convert from command queue into draw list and draw to screen
+      (gl:bind-vertex-array vao)
+      (gl:bind-buffer :array-buffer vbo)
+      (gl:bind-buffer :element-array-buffer ebo)
+
+      (%gl:buffer-data :array-buffer
+                       max-vertex-buffer (cffi:null-pointer) :stream-draw)
+      (%gl:buffer-data :element-array-buffer
+                       max-element-buffer (cffi:null-pointer) :stream-draw)
+
+      ;; load draw vertices & elements directly into vertex + element buffer
+      (let ((vertices (gl:map-buffer :array-buffer :write-only))
+            (elements (gl:map-buffer :element-array-buffer :write-only)))
+        (c-with ((config (:struct (%nk:convert-config))))
+          ;; fill convert configuration
+          (%memset (config :&) 0 #.(claw:sizeof '(:struct (%nk:convert-config))))
+          (setf (config :vertex-layout) vertex-layout-ptr)
+          (setf (config :vertex-size)
+                #.(cffi:foreign-type-size '(:struct nk-bodge-vertex)))
+          (setf (config :vertex-alignment)
+                #.(cffi:foreign-type-alignment '(:struct nk-bodge-vertex)))
+          (%memcpy (config :null :&) null-tex
+                   #.(claw:sizeof '(:struct (%nk:draw-null-texture))))
+          (setf (config :circle-segment-count) 22)
+          (setf (config :curve-segment-count) 22)
+          (setf (config :arc-segment-count) 22)
+          (setf (config :global-alpha) 1.0f0)
+          (setf (config :shape-aa) aa)
+          (setf (config :line-aa) aa)
+
+          ;; setup buffers to load vertices and elements
+          (claw:c-with ((vbuf (:struct (%nk:buffer)))
+                        (ebuf (:struct (%nk:buffer))))
+            (%nk:buffer-init-fixed (vbuf :&) vertices max-vertex-buffer)
+            (%nk:buffer-init-fixed (ebuf :&) elements max-element-buffer)
+            (%nk:convert context cmds (vbuf :&) (ebuf :&) (config :&)))))
+
+      (gl:unmap-buffer :array-buffer)
+      (gl:unmap-buffer :element-array-buffer)
+
+      ;; iterate over and execute each draw command
+
+      (loop
+         :with offset := (cffi:make-pointer 0)
+         :for cmd-ptr := (%nk:draw-list-begin context cmds)
+         :while (not (cffi:null-pointer-p cmd-ptr))
+         :do
+           (c-let ((cmd (:struct (%nk:draw-command)) :from cmd-ptr))
+             (let ((elem-count (cmd :elem-count)))
+               (when (> (cmd :elem-count) 0)
+                 (gl:bind-texture :texture-2d (cmd :texture :id))
+                 (gl:scissor (floor (* (cmd :clip-rect :x) pixel-ratio))
+                             (floor (* (- height (+ (cmd :clip-rect :y)
+                                                    (cmd :clip-rect :h)))
+                                       pixel-ratio))
+                             (floor (* (cmd :clip-rect :w) pixel-ratio))
+                             (floor (* (cmd :clip-rect :h) pixel-ratio)))
+                 (%gl:draw-elements
+                  :triangles elem-count :unsigned-short offset)
+                 (cffi:incf-pointer offset elem-count))))
+           (%nk:draw-list-next cmd-ptr cmds context))
+
+      ;; default OpenGL state
+      (gl:use-program 0)
+      (gl:bind-buffer :array-buffer 0)
+      (gl:bind-buffer :element-array-buffer 0)
+      (gl:bind-vertex-array 0)
+      (gl:disable :blend)
+      (gl:disable :scissor-test)
+      t)))

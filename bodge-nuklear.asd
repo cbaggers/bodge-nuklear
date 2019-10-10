@@ -4,7 +4,7 @@
   :author "Pavel Korolev"
   :mailto "dev@borodust.org"
   :license "MIT"
-  :depends-on (alexandria cffi claw)
+  :depends-on (alexandria cffi claw cl-opengl)
   :serial t
   :components ((:file "packages")
                (:static-file "bodge_nuklear.h")
