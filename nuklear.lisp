@@ -21,8 +21,8 @@
 
 (cffi:defcstruct nk-bodge-vertex
   (position (:array :float 2))
-  (texture (:array :float 2))
-  (color (:array :uint8 4)))
+  (uv (:array :float 2))
+  (col (:array :uint8 4)))
 
 (defclass nuklear-renderer ()
   ((cmds :initarg :cmds
@@ -85,36 +85,34 @@
                       max-vertex-buffer max-element-buffer
                       vertex-layout-ptr)
         rndr
-      (let* ((nk-shader-version
-              #+darwin "#version 150\n"
-              #-darwin "#version 300 es\n")
+      (let* ((nk-shader-version "#version 330")
              (vertex-shader
-              (concatenate
-               'string
-               nk-shader-version
-               "uniform mat4 ProjMtx;\n"
-               "in vec2 Position;\n"
-               "in vec2 TexCoord;\n"
-               "in vec4 Color;\n"
-               "out vec2 Frag_UV;\n"
-               "out vec4 Frag_Color;\n"
-               "void main() {\n"
-               "   Frag_UV = TexCoord;\n"
-               "   Frag_Color = Color;\n"
-               "   gl_Position = ProjMtx * vec4(Position.xy, 0, 1);\n"
-               "}\n"))
+              (format nil
+                      "~{~a~%~}"
+                      (list nk-shader-version
+                            "uniform mat4 ProjMtx;"
+                            "in vec2 Position;"
+                            "in vec2 TexCoord;"
+                            "in vec4 Color;"
+                            "out vec2 Frag_UV;"
+                            "out vec4 Frag_Color;"
+                            "void main() {"
+                            "   Frag_UV = TexCoord;"
+                            "   Frag_Color = Color;"
+                            "   gl_Position = ProjMtx * vec4(Position.xy, 0, 1);"
+                            "}")))
              (fragment-shader
-              (concatenate
-               'string
-               nk-shader-version
-               "precision mediump float;\n"
-               "uniform sampler2D Texture;\n"
-               "in vec2 Frag_UV;\n"
-               "in vec4 Frag_Color;\n"
-               "out vec4 Out_Color;\n"
-               "void main(){\n"
-               "   Out_Color = Frag_Color * texture(Texture, Frag_UV.st);\n"
-               "}\n")))
+              (format nil
+                      "~{~a~%~}"
+                      (list nk-shader-version
+                            "precision mediump float;"
+                            "uniform sampler2D Texture;"
+                            "in vec2 Frag_UV;"
+                            "in vec4 Frag_Color;"
+                            "out vec4 Out_Color;"
+                            "void main(){"
+                            "   Out_Color = Frag_Color * texture(Texture, Frag_UV.st);"
+                            "}"))))
         (setf max-vertex-buffer max-vertex-buff-len
               max-element-buffer max-element-buff-len)
         (%nk:buffer-init-default cmds)
@@ -124,19 +122,20 @@
         (gl:shader-source vert-shdr vertex-shader)
         (gl:shader-source frag-shdr fragment-shader)
         (gl:compile-shader vert-shdr)
-        (gl:compile-shader frag-shdr)
         (assert (gl:get-shader vert-shdr :compile-status))
+        (gl:compile-shader frag-shdr)
         (assert (gl:get-shader frag-shdr :compile-status))
         (gl:attach-shader prog vert-shdr)
         (gl:attach-shader prog frag-shdr)
         (gl:link-program prog)
         (assert (gl:get-program prog :link-status))
 
-        (setf uniform-tex (gl:get-uniform-location prog "Texture")
-              uniform-proj (gl:get-uniform-location prog "ProjMtx")
-              attrib-pos (gl:get-uniform-location prog "Position")
-              attrib-uv (gl:get-uniform-location prog "TexCoord")
-              attrib-col (gl:get-uniform-location prog "Color"))
+        (setf uniform-proj (gl:get-uniform-location prog "ProjMtx")
+              uniform-tex (gl:get-uniform-location prog "Texture")
+              
+              attrib-pos (gl:get-attrib-location prog "Position")
+              attrib-uv (gl:get-attrib-location prog "TexCoord")
+              attrib-col (gl:get-attrib-location prog "Color"))
 
         (let* ((vs (cffi:foreign-type-size '(:struct nk-bodge-vertex)))
                (vp (cffi:foreign-slot-offset '(:struct nk-bodge-vertex)
@@ -159,7 +158,7 @@
 
           (gl:vertex-attrib-pointer attrib-pos 2 :float nil vs vp)
           (gl:vertex-attrib-pointer attrib-uv 2 :float nil vs vt)
-          (gl:vertex-attrib-pointer attrib-col 4 :uint8 t vs vc))
+          (gl:vertex-attrib-pointer attrib-col 4 :byte t vs vc))
 
         (gl:bind-texture :texture-2d 0)
         (gl:bind-buffer :array-buffer 0)
@@ -291,7 +290,7 @@
 (declaim
  (type (simple-array single-float (16)) *ortho*))
 (defvar *ortho*
-  (make-array 16 :element-type :float
+  (make-array 16 :element-type 'single-float
               :initial-contents
               '(2.0f0 0.0f0 0.0f0 0.0f0 
                 0.0f0 -2.0f0 0.0f0 0.0f0 
@@ -364,32 +363,34 @@
                         (ebuf (:struct (%nk:buffer))))
             (%nk:buffer-init-fixed (vbuf :&) vertices max-vertex-buffer)
             (%nk:buffer-init-fixed (ebuf :&) elements max-element-buffer)
-            (%nk:convert context cmds (vbuf :&) (ebuf :&) (config :&)))))
+            (%nk:convert context cmds (vbuf :&) (ebuf :&) (config :&))))
 
-      (gl:unmap-buffer :array-buffer)
-      (gl:unmap-buffer :element-array-buffer)
+        (gl:unmap-buffer :array-buffer)
+        (gl:unmap-buffer :element-array-buffer))
 
       ;; iterate over and execute each draw command
-
-      (loop
-         :with offset := (cffi:make-pointer 0)
-         :for cmd-ptr := (%nk:draw-list-begin context cmds)
-         :while (not (cffi:null-pointer-p cmd-ptr))
-         :do
-           (c-let ((cmd (:struct (%nk:draw-command)) :from cmd-ptr))
-             (let ((elem-count (cmd :elem-count)))
-               (when (> (cmd :elem-count) 0)
-                 (gl:bind-texture :texture-2d (cmd :texture :id))
-                 (gl:scissor (floor (* (cmd :clip-rect :x) pixel-ratio))
-                             (floor (* (- height (+ (cmd :clip-rect :y)
-                                                    (cmd :clip-rect :h)))
-                                       pixel-ratio))
-                             (floor (* (cmd :clip-rect :w) pixel-ratio))
-                             (floor (* (cmd :clip-rect :h) pixel-ratio)))
-                 (%gl:draw-elements
-                  :triangles elem-count :unsigned-short offset)
-                 (cffi:incf-pointer offset elem-count))))
-           (%nk:draw-list-next cmd-ptr cmds context))
+      (let ((cmd-ptr (%nk:draw-list-begin context cmds)))
+        ;; {TODO} this checking for null is weird, something to do with claw?
+        (when cmd-ptr
+          (loop
+             :with offset := (cffi:make-pointer 0)
+             :for q :from 0
+             :while (and cmd-ptr (not (cffi:null-pointer-p cmd-ptr)))
+             :do
+               (c-let ((cmd (:struct (%nk:draw-command)) :from cmd-ptr))
+                 (let ((elem-count (cmd :elem-count)))
+                   (when (> (cmd :elem-count) 0)
+                     (gl:bind-texture :texture-2d (cmd :texture :id))
+                     (gl:scissor (floor (* (cmd :clip-rect :x) pixel-ratio))
+                                 (floor (* (- height (+ (cmd :clip-rect :y)
+                                                        (cmd :clip-rect :h)))
+                                           pixel-ratio))
+                                 (floor (* (cmd :clip-rect :w) pixel-ratio))
+                                 (floor (* (cmd :clip-rect :h) pixel-ratio)))
+                     (%gl:draw-elements
+                      :triangles elem-count :unsigned-short offset)
+                     (cffi:incf-pointer offset elem-count))))
+               (setf cmd-ptr (%nk:draw-list-next cmd-ptr cmds context)))))
 
       ;; default OpenGL state
       (gl:use-program 0)
